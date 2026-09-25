@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Config (contains API key)
+.icf-review-chain/
+
+# Output
+deliberations/
+review-*/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+tmp/
+*.tmp
+
+# Internal docs (not for public repo)
+DEPLOYMENT_PLAN.md
+
+# Include built binaries
+!dist/
+
+# Virtual REB Deliberation Simulator (separate project)
+personas/
+templates/
+
+# Protocol/ICF documents (may contain PHI)
+protocols/
+
+# PyInstaller spec
+*.spec
