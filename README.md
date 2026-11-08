@@ -15,6 +15,8 @@ pip install -r requirements.txt
 
 Run from source. There is no prebuilt executable: a binary you cannot inspect has no place in a tool that reads consent documents.
 
+(`review_chain.py` is the separate orchestration script for the Hermes platform; this README covers the standalone CLI.)
+
 ## Configure
 
 Each setting is read from the environment first, then from `~/.icf-review-chain/config.json` (use the lowercase key), then the default.
@@ -39,7 +41,7 @@ python3 review_chain_standalone.py                                  # prompts fo
 python3 review_chain_standalone.py icf.pdf protocol.pdf --yes       # do not pause on input warnings
 ```
 
-Inputs are PDF or plain text (a form-feed character is treated as a page break). Word files must be saved as PDF first.
+Inputs are PDF or plain text (a form-feed character is treated as a page break). Text files are read as UTF-8, or as Windows-1252 if they are not valid UTF-8. Word files must be saved as PDF first.
 
 ## Input checks (before anything is sent)
 
@@ -60,11 +62,11 @@ Nothing is silently dropped.
 - **Unreadable pages** (scans with no text layer) and password-protected PDFs are detected and reported. Run OCR on scans first.
 - **Output cut off at the token limit** is detected and reported.
 
-The report begins with `Review status: COMPLETE` or `INCOMPLETE - HUMAN REVIEW REQUIRED`, followed by any problems. The process exits with status `0` (complete), `1` (error), or `2` (finished but incomplete).
+The report begins with `Review status: COMPLETE` or `INCOMPLETE - HUMAN REVIEW REQUIRED`, followed by any problems. The process exits with status `0` (complete), `1` (error), or `2` (finished but incomplete). Command-line usage errors also exit with `2`, following the usual argparse convention, and print a usage message instead of writing a report.
 
 ## What it verifies in code
 
-- **Every quotation** in Agent 2's table (and every sizeable quotation in Agent 1's output) is checked against the extracted document text, ignoring case, spacing, hyphenation, and line breaks. Each is marked `VERIFIED`, `PARTIAL`, `NOT FOUND`, or `VERIFIED, PAGE MISMATCH`. `[...]` and `[REDACTED]` in a quote are treated as gaps. Critical alerts that rest on an unverified quote are labelled `[QUOTE NOT VERIFIED]` in the summary.
+- **Every quotation** in Agent 2's table (and every sizeable quotation in Agent 1's output) is checked against the extracted document text, ignoring case, spacing, line breaks, words split by a hyphen at a line end, and punctuation between words. Numbers keep their decimal point or thousands separator and currency signs count, so `1.5 mg` does not match `15 mg` and `$1,000` does not match `$10.00`. A quote must start and end on whole words or numbers, so `up to 10` does not match `up to 100`. Each is marked `VERIFIED`, `VERIFIED, PAGE MISMATCH`, `PARTIAL`, `NOT FOUND`, or `TOO SHORT TO CHECK` (under 8 letters and digits). Only `...`, `[...]` and `[REDACTED]` in a quote are treated as gaps; the pieces around a gap must appear in order, within about a paragraph of each other, and a piece under 8 letters and digits makes the quote `PARTIAL`. Any other bracketed text, such as `[not]`, must be in the document. Critical alerts that rest on an unverified quote are labelled `[QUOTE NOT VERIFIED]` in the summary.
 - **Readability** (Flesch-Kincaid grade level) is calculated in code, for the whole ICF and for each quoted ICF passage of 15 or more words. It is an English-language formula; French text is reported as `n/a`.
 - **Summary counts, critical alerts, and the human-review list** are computed from the parsed table rows, not written by the model.
 - Table lines that do not match the nine-column format are kept verbatim at the end of the Agent 2 section, never discarded.
@@ -74,10 +76,12 @@ The report begins with `Review status: COMPLETE` or `INCOMPLETE - HUMAN REVIEW R
 Each run writes `review-<timestamp>/` containing:
 
 - `unified_report.md` (status, coverage, Agent 1, merged Agent 2, handoff, unverified quotations)
-- `agent1_output.md`, `agent2_output.md`, `agent2_parts/` (raw model output for each protocol part)
+- `agent1_output.md` (raw model output for Agent 1)
+- `agent2_output.md` (Agent 2's merged comparison table, with quote checks, as built by the tool)
+- `agent2_parts/` (raw model output for each protocol part)
 - `run_metadata.json` (model, settings, SHA-256 of both input files, every call's finish reason, problems and warnings)
 
-If a run fails after Agent 1 (for example an authentication or context-length error), the error message names the `review-<timestamp>/` folder, which keeps Agent 1's output, any completed protocol parts, and a `run_metadata.json` with status `FAILED`. Transient errors (rate limits, timeouts, server errors) are retried three times with backoff before giving up.
+If a run fails after Agent 1 (for example an authentication or context-length error), the error message names the `review-<timestamp>/` folder, which keeps Agent 1's output, any completed protocol parts, and a `run_metadata.json` with status `FAILED`. Transient errors (rate limits, timeouts, server errors) are tried up to three times in all, with backoff, before giving up.
 
 ## Limits
 
@@ -86,6 +90,14 @@ If a run fails after Agent 1 (for example an authentication or context-length er
 - Section headings are detected heuristically. A poor guess only changes where a part begins; it never loses text.
 - A protocol too small to need splitting is sent whole. A very long protocol means many calls, so check your provider's cost and rate limits.
 - **Privacy:** the text of both documents is sent to the LLM provider you configure. Confirm that this is permitted for the documents involved (institutional policy, applicable privacy law, provider terms) before running real submissions.
+
+## Regulatory framework
+
+The agent prompts refer to:
+
+- TCPS 2 (2022) for research ethics
+- Civil Code of Québec arts. 10-25 for consent and capacity
+- Privacy law: R-22.1 (health information), A-2.1 (public-body records), P-39.1 (private sector only)
 
 ## Tests
 

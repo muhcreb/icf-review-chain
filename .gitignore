@@ -33,9 +33,6 @@ tmp/
 # Internal docs (not for public repo)
 DEPLOYMENT_PLAN.md
 
-# Include built binaries
-!dist/
-
 # Virtual REB Deliberation Simulator (separate project)
 personas/
 templates/

@@ -179,6 +179,59 @@ try:
 except rc.ReviewError as e:
     check("text file renamed .pdf rejected", "Could not read" in str(e), str(e)[:80])
 
+# --- a part never exceeds its budget, even after a blank-line cut ---
+para = " ".join(["The protocol describes procedures in detail."] * 20)   # ~900 chars
+awkward = rc.document_from_text("\n".join(["short line"] * 60 + [""] + [para] * 18 + ["word " * 3200]), "PROTOCOL", "p")
+sizes = [len(c.text) for c in rc.chunk_document(awkward, 17983)]
+check("blank-line cut followed by long lines stays within budget", max(sizes) <= 17983, str(sizes))
+tidy = rc.document_from_text("\n".join(["short line"] * 60 + [""] + [para] * 3), "PROTOCOL", "p")
+check("a section that fits is not split", len(rc.chunk_document(tidy, 17983)) == 1)
+
+# --- quote checks on the facts that matter: numbers, negation, arms ---
+facts = rc.document_from_text(
+    "Group A will receive the study drug. Group B will receive placebo. The study lasts 12 weeks. "
+    "You will be paid $10.00 per visit. The dose is 1.5 mg daily. Participants will receive "
+    "compensation for travel. We draw up to 100 mL of blood.", "ICF", "facts")
+fv = rc.QuoteVerifier(facts)
+for quote, expected in [
+    ("You will be paid $10.00 per visit", "VERIFIED"),
+    ("You will be paid $1,000 per visit", "NOT FOUND"),
+    ("The dose is 1.5 mg daily", "VERIFIED"),
+    ("The dose is 15 mg daily", "NOT FOUND"),
+    ("We draw up to 100 mL", "VERIFIED"),
+    ("We draw up to 10", "NOT FOUND"),
+    ("Participants will receive compensation", "VERIFIED"),
+    ("Participants will [not] receive compensation", "NOT FOUND"),
+    ("Group B will receive placebo. The study lasts 12 weeks", "VERIFIED"),
+    ("Group B will receive [...] lasts 12 weeks", "VERIFIED"),
+]:
+    got = fv.verify(quote)
+    check(f"quote {quote!r} -> {expected}", got == expected, got)
+check("short fragment after a gap is not trusted",
+      fv.verify("Group A will receive [...] placebo").startswith("PARTIAL"), fv.verify("Group A will receive [...] placebo"))
+check("fragments out of order are not VERIFIED",
+      fv.verify("The study lasts 12 weeks ... Group B will receive placebo").startswith("PARTIAL"))
+far = rc.document_from_text("The first sentence of the form is here. " + "filler words " * 400 + "The last sentence of the form is here.", "ICF", "far")
+check("fragments too far apart are not VERIFIED",
+      rc.QuoteVerifier(far).verify("The first sentence of the form ... The last sentence of the form").startswith("PARTIAL"))
+
+# --- merged duplicate keeps a failed quote check ---
+dup = [dict(zip(rc.TABLE_COLUMNS, ["Item", "VAGUE", "LOW", "", "", "", "", "", "n"]), _part=1, _quotes_ok=True),
+       dict(zip(rc.TABLE_COLUMNS, ["Item", "VAGUE", "LOW", "", "", "", "", "", "n"]), _part=2, _quotes_ok=False)]
+for row in dup:
+    row["Quote check"] = "Protocol: VERIFIED" if row["_quotes_ok"] else "Protocol: NOT FOUND"
+merged = rc.merge_rows(dup)
+check("duplicate with an unverified quote keeps the row flagged", len(merged) == 1 and merged[0]["_quotes_ok"] is False)
+clean_dup = [dict(r, _quotes_ok=True) for r in dup]
+check("duplicate with verified quotes stays verified", rc.merge_rows(clean_dup)[0]["_quotes_ok"] is True)
+
+# --- text files in Windows-1252 are decoded, not garbled ---
+open("fr_cp1252.txt", "wb").write("Votre participation est volontaire et sans préjudice à vos soins.".encode("cp1252"))
+fr = rc.extract_document("fr_cp1252.txt", "ICF")
+check("cp1252 text decoded correctly", "préjudice à" in fr.pages[0], fr.pages[0][:60])
+open("fr_utf8.txt", "w", encoding="utf-8").write("Votre participation est volontaire et sans préjudice.")
+check("UTF-8 text still decoded as UTF-8", "préjudice" in rc.extract_document("fr_utf8.txt", "ICF").pages[0])
+
 print()
 print("FAILED:" if fails else "ALL UNIT CHECKS PASSED", fails if fails else "")
 sys.exit(1 if fails else 0)

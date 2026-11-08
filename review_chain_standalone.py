@@ -475,7 +475,11 @@ def extract_document(filepath, label):
                 f"{filepath} looks like a binary file. Convert the {label} to PDF "
                 "or plain text first."
             )
-        text = data.decode("utf-8", errors="replace")
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            # Not UTF-8: most likely a Windows-1252 file (common for French text on Windows).
+            text = data.decode("cp1252", errors="replace")
         pages = text.split("\f") if "\f" in text else [text]
 
     return _build_doc(label, str(path), _sha256(data), pages)
@@ -602,6 +606,10 @@ def _split_oversized(segment, limit):
             if cut:
                 pieces.append(current[:cut])
                 current = current[cut:]
+                # The lines kept after the cut may still leave no room for this one.
+                if _size(current) + len(text) + 1 > limit:
+                    pieces.append(current)
+                    current = []
             else:
                 pieces.append(current)
                 current = []
@@ -717,53 +725,113 @@ def _alnum_key(text):
     return re.sub(r"[\W_]+", "", text)
 
 
+# Tokens for quote matching: numbers keep their internal decimal or thousands
+# separator, so "1.5" never matches "15" and "$1,000" never matches "$10.00".
+QUOTE_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)*|[^\W\d_]+|[$€£%]")
+# Only these mark an omission inside a quote. Other bracketed text, such as
+# "[not]", is treated as part of the quote and must be in the document.
+QUOTE_GAP_RE = re.compile(r"\.{3}|…|\[\s*(?:\.{3}|…|redacted)\s*\]", re.IGNORECASE)
+# Omitted text between two fragments of one quote may span at most this many
+# key characters (roughly a long paragraph).
+MAX_QUOTE_GAP = 1500
+# A fragment shorter than this (after normalising) matches too easily to count.
+MIN_FRAGMENT_CHARS = 8
+
+
+def _quote_key(text):
+    """(key, starts, ends): text reduced to matchable tokens, plus the key
+    offsets where a token starts and where one ends. A match must begin and
+    end on token boundaries, so "up to 10" does not match "up to 100"."""
+    text = unicodedata.normalize("NFKC", text).casefold()
+    text = PAGE_MARKER_ANYWHERE_RE.sub(" ", text)
+    pieces, starts, ends, offset = [], set(), set(), 0
+    for match in QUOTE_TOKEN_RE.finditer(text):
+        token = match.group()
+        pieces.append(token)
+        starts.add(offset)
+        offset += len(token)
+        ends.add(offset)
+    return "".join(pieces), starts, ends
+
+
 class QuoteVerifier:
     """Checks quotations against the extracted text of one document."""
 
     def __init__(self, doc):
         self.page_count = len(doc.pages)
-        self._page_keys = [_alnum_key(PAGE_MARKER_ANYWHERE_RE.sub(" ", p)) for p in doc.pages]
-        self._full = "".join(self._page_keys)
-        self._starts = []
+        keys, self._starts_ok, self._ends_ok, self._page_starts = [], set(), set(), []
         offset = 0
-        for key in self._page_keys:
-            self._starts.append(offset)
+        for page in doc.pages:
+            key, starts, ends = _quote_key(page)
+            self._page_starts.append(offset)
+            keys.append(key)
+            self._starts_ok |= {offset + s for s in starts}
+            self._ends_ok |= {offset + e for e in ends}
             offset += len(key)
+        self._page_lengths = [len(k) for k in keys]
+        self._full = "".join(keys)
 
-    def _pages_for(self, offset, length):
+    def _pages_for(self, start, end):
         pages = set()
-        end = offset + max(length, 1) - 1
-        for number, start in enumerate(self._starts, start=1):
-            stop = start + len(self._page_keys[number - 1]) - 1
-            if start <= end and offset <= stop:
+        for number, page_start in enumerate(self._page_starts, start=1):
+            page_end = page_start + self._page_lengths[number - 1]
+            if page_start < end and start < page_end:
                 pages.add(number)
         return pages
 
+    def _find(self, key, start=0, stop=None):
+        """First match of key at or after start, on token boundaries, beginning
+        before stop. Returns its start offset or -1."""
+        while True:
+            where = self._full.find(key, start)
+            if where < 0 or (stop is not None and where > stop):
+                return -1
+            if where in self._starts_ok and where + len(key) in self._ends_ok:
+                return where
+            start = where + 1
+
+    def _chain(self, keys, first_at):
+        """Match keys in order from first_at, each within MAX_QUOTE_GAP of the
+        previous one. Returns the (start, end) span or None."""
+        end = first_at + len(keys[0])
+        for key in keys[1:]:
+            where = self._find(key, end, end + MAX_QUOTE_GAP)
+            if where < 0:
+                return None
+            end = where + len(key)
+        return first_at, end
+
     def verify(self, quote, cited_pages=()):
-        """Return a status string: VERIFIED, PARTIAL, NOT FOUND, or TOO SHORT."""
-        fragments = re.split(r"\.{3}|\u2026|\[[^\]]*\]", quote)
-        keys = [k for k in (_alnum_key(f) for f in fragments) if len(k) >= 8]
-        if not keys:
+        """Return a status string: VERIFIED, VERIFIED with PAGE MISMATCH,
+        PARTIAL, NOT FOUND, or TOO SHORT TO CHECK."""
+        fragments = [f for f in QUOTE_GAP_RE.split(quote) if _quote_key(f)[0]]
+        keys = [_quote_key(f)[0] for f in fragments]
+        if not keys or sum(len(k) for k in keys) < MIN_FRAGMENT_CHARS:
             return "TOO SHORT TO CHECK"
-        found = 0
-        found_pages = set()
-        for key in keys:
-            position = self._full.find(key)
-            if position < 0:
-                continue
-            found += 1
-            scan = 0
-            for _ in range(50):
-                where = self._full.find(key, scan)
-                if where < 0:
-                    break
-                found_pages |= self._pages_for(where, len(key))
-                scan = where + 1
-        if found == 0:
-            return "NOT FOUND"
-        if found < len(keys):
-            return f"PARTIAL ({found} of {len(keys)} fragments found)"
+
+        spans = []
+        where = self._find(keys[0])
+        while where >= 0 and len(spans) < 50:
+            span = self._chain(keys, where)
+            if span:
+                spans.append(span)
+            where = self._find(keys[0], where + 1)
+
+        if not spans:
+            found = sum(1 for k in keys if self._find(k) >= 0)
+            if found == 0:
+                return "NOT FOUND"
+            return f"PARTIAL ({found} of {len(keys)} fragments found, not in order or too far apart)"
+
+        if len(keys) > 1:
+            short = [f.strip() for f, k in zip(fragments, keys) if len(k) < MIN_FRAGMENT_CHARS]
+            if short:
+                return f'PARTIAL (fragment too short to check: "{short[0]}")'
+
         cited = set(cited_pages)
+        found_pages = set()
+        for start, end in spans:
+            found_pages |= self._pages_for(start, end)
         if cited and self.page_count > 1 and found_pages and not (cited & found_pages):
             listed = ",".join(str(n) for n in sorted(found_pages)[:5])
             return f"VERIFIED, PAGE MISMATCH (found on p.{listed})"
@@ -865,6 +933,12 @@ def merge_rows(rows):
             existing = seen[key]
             if existing["Status"].upper() == row["Status"].upper():
                 existing["Notes"] += f" (also reported in protocol part {row['_part']})"
+                if not row.get("_quotes_ok", True):
+                    existing["_quotes_ok"] = False
+                    existing["Quote check"] = (
+                        f"{existing.get('Quote check', '')}; protocol part {row['_part']}: "
+                        f"{row.get('Quote check', '')}"
+                    ).lstrip("; ")
             else:
                 for target in (existing, row):
                     target["Notes"] += " CONFLICT: same item reported with a different status in another protocol part - HUMAN REVIEW REQUIRED."
