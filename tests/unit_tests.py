@@ -7,6 +7,10 @@ os.chdir(tempfile.mkdtemp(prefix="icf-chain-tests-"))   # fixtures and outputs l
 make_fixtures.build_all()
 import re
 import review_chain_standalone as rc
+import unicodedata
+
+def alnum_key(text):
+    return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", text).casefold())
 
 fails = []
 def check(name, cond, detail=""):
@@ -23,7 +27,7 @@ full = rc.PAGE_MARKER_ANYWHERE_RE.sub(" ", protocol.marked_text())
 for budget in (60000, 20000, 8000, 4000):
     chunks = rc.chunk_document(protocol, budget)
     joined = rc.PAGE_MARKER_ANYWHERE_RE.sub(" ", "\n".join(c.text for c in chunks))
-    same = rc._alnum_key(full) == rc._alnum_key(joined)
+    same = alnum_key(full) == alnum_key(joined)
     biggest = max(len(c.text) for c in chunks)
     check(f"chunking budget={budget}: no text lost", same, f"{len(chunks)} parts")
     check(f"chunking budget={budget}: every part within budget", biggest <= budget, f"largest {biggest}")
@@ -207,6 +211,22 @@ for quote, expected in [
 ]:
     got = fv.verify(quote)
     check(f"quote {quote!r} -> {expected}", got == expected, got)
+for quote, source in [("attend 1-2 visits", "You attend 12 visits in total."),
+                      ("attend 12 visits", "You attend 1-2 visits in total."),
+                      ("take 1/2 tablet daily", "You take 12 tablet daily doses."),
+                      ("randomised 2:1 to the drug", "Participants are randomised 21 to the drug group.")]:
+    got = rc.QuoteVerifier(rc.document_from_text(source, "ICF", "n")).verify(quote)
+    check(f"adjacent numbers kept apart: {quote!r}", got == "NOT FOUND", got)
+check("number range matches itself",
+      rc.QuoteVerifier(rc.document_from_text("You attend 1-2 visits in total.", "ICF", "n")).verify("attend 1-2 visits") == "VERIFIED")
+layout = rc._build_doc("ICF", "l", "d", [
+    "You may with-\ndraw from the study at any time. The \ufb01nal visit is optional.\nVotre participation est volontaire et sans pre\u0301judice.\nThe study team will keep your",
+    "samples for ten years after the end of the study."])
+lv = rc.QuoteVerifier(layout)
+check("line-end hyphenation ignored", lv.verify("You may withdraw from the study at any time") == "VERIFIED")
+check("ligature matched", lv.verify("The final visit is optional") == "VERIFIED")
+check("accented French matched (composed vs decomposed)", lv.verify("participation est volontaire et sans pr\u00e9judice") == "VERIFIED")
+check("quote across a page break verified", lv.verify("will keep your samples for ten years", {1, 2}) == "VERIFIED")
 check("short fragment after a gap is not trusted",
       fv.verify("Group A will receive [...] placebo").startswith("PARTIAL"), fv.verify("Group A will receive [...] placebo"))
 check("fragments out of order are not VERIFIED",

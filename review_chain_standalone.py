@@ -719,12 +719,6 @@ def readability_label(text, min_words=30):
 # -- Quote verification --------------------------------------------------
 
 
-def _alnum_key(text):
-    """Reduce text to lowercase letters and digits so layout cannot matter."""
-    text = unicodedata.normalize("NFKC", text).casefold()
-    return re.sub(r"[\W_]+", "", text)
-
-
 # Tokens for quote matching: numbers keep their internal decimal or thousands
 # separator, so "1.5" never matches "15" and "$1,000" never matches "$10.00".
 QUOTE_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)*|[^\W\d_]+|[$€£%]")
@@ -745,8 +739,15 @@ def _quote_key(text):
     text = unicodedata.normalize("NFKC", text).casefold()
     text = PAGE_MARKER_ANYWHERE_RE.sub(" ", text)
     pieces, starts, ends, offset = [], set(), set(), 0
+    previous_was_number = False
     for match in QUOTE_TOKEN_RE.finditer(text):
         token = match.group()
+        is_number = token[0].isdigit()
+        if is_number and previous_was_number:
+            # Keep two numbers apart, so "1-2 visits" never matches "12 visits".
+            pieces.append("|")
+            offset += 1
+        previous_was_number = is_number
         pieces.append(token)
         starts.add(offset)
         offset += len(token)
@@ -1364,9 +1365,9 @@ def verify_agent1_quotes(text, icf_verifier, protocol_verifier):
             continue
         status = icf_verifier.verify(quote)
         where = "ICF"
-        if status == "NOT FOUND":
+        if not status.startswith("VERIFIED"):
             other = protocol_verifier.verify(quote)
-            if other != "NOT FOUND":
+            if other.startswith("VERIFIED") or (status == "NOT FOUND" and other != "NOT FOUND"):
                 status, where = other, "Protocol"
         results.append((quote, status, where))
     return results
